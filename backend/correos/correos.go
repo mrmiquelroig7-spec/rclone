@@ -2,7 +2,6 @@ package correos
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -19,6 +18,7 @@ import (
 )
 
 var _ fs.Fs = (*Fs)(nil)
+var _ fs.Object = (*Object)(nil)
 
 func init() {
 	fs.Register(&fs.RegInfo{
@@ -111,7 +111,6 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 	var result ListResponse
 	fs.Debugf(f, "List(%q): GET %s", dir, opts.Path)
 	_, err = f.srv.CallJSON(ctx, &opts, nil, &result)
-	b, _ := json.MarshalIndent(result, "", "  ")
 	fs.Debugf(f, "List(%q): received %d items", dir, len(result.Items))
 	if err != nil {
 		return nil, fmt.Errorf("error al listar elementos de Correos: %w", err)
@@ -162,11 +161,14 @@ func (f *Fs) Mkdir(ctx context.Context, dir string) error { return nil }
 func (f *Fs) Rmdir(ctx context.Context, dir string) error { return nil }
 func (f *Fs) Features() *fs.Features                      { return &fs.Features{} }
 func (f *Fs) Hashes() hash.Set                            { return hash.Set(hash.None) }
-func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
+func (f *Fs) NewObject(context.Context, string) (fs.Object, error) {
 	return nil, fs.ErrorObjectNotFound
 }
 func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
 	return nil, errors.New("operación Put no implementada")
+}
+func (f *Fs) deleteObject(context.Context, string) error {
+	return nil
 }
 
 type Object struct {
@@ -189,6 +191,10 @@ func (o *Object) Hash(ctx context.Context, ty hash.Type) (string, error) {
 	return "", hash.ErrUnsupported
 }
 func (o *Object) Storable() bool { return true }
+func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
+	return errors.New("operación Update no implementada")
+}
+func (o *Object) Remove(ctx context.Context) error { return o.fs.deleteObject(ctx, o.remote) }
 
 func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
 	fileIDStr := fmt.Sprintf("%d", o.id)

@@ -109,10 +109,10 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 		)}
 
 	var result ListResponse
-	fmt.Println("PATH:", opts.Path)
+	fs.Debugf(f, "List(%q): GET %s", dir, opts.Path)
 	_, err = f.srv.CallJSON(ctx, &opts, nil, &result)
 	b, _ := json.MarshalIndent(result, "", "  ")
-	fmt.Println(string(b))
+	fs.Debugf(f, "List(%q): received %d items", dir, len(result.Items))
 	if err != nil {
 		return nil, fmt.Errorf("error al listar elementos de Correos: %w", err)
 	}

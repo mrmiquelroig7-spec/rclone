@@ -90,6 +90,7 @@ type CorreosItem struct {
 	FileName  string `json:"fileName"`
 	CreatedAt string `json:"createdAt"`
 	ID        int64  `json:"id"`
+	RawSize   any    `json:"size"`
 }
 
 func (i CorreosItem) DisplayName() string {
@@ -123,6 +124,8 @@ func parseSize(value any) int64 {
 		return int64(v)
 	case int64:
 		return v
+	case int32:
+		return int64(v)
 	case float64:
 		return int64(v)
 	case float32:
@@ -132,6 +135,10 @@ func parseSize(value any) int64 {
 			if parsed, err := strconv.ParseInt(trimmed, 10, 64); err == nil {
 				return parsed
 			}
+		}
+	case json.Number:
+		if parsed, err := v.Int64(); err == nil {
+			return parsed
 		}
 	}
 	return 0
@@ -335,12 +342,14 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 				remote:  rutaElemento,
 				id:      item.ID,
 				doc:     &item,
-				size:    0,
+				size:    parseSize(item.RawSize),
 				modTime: t,
 				loaded:  false,
 			}
-			if doc, err := o.getDocument(context.Background()); err == nil && doc != nil {
-				o.size = parseSize(doc.FileSize)
+			if o.size == 0 {
+				if doc, err := o.getDocument(ctx); err == nil && doc != nil {
+					o.size = parseSize(doc.FileSize)
+				}
 			}
 			entries = append(entries, o)
 		}
@@ -376,12 +385,14 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 		remote:  route,
 		id:      item.ID,
 		doc:     item,
-		size:    0,
+		size:    parseSize(item.RawSize),
 		modTime: time.Now(),
 		loaded:  false,
 	}
-	if doc, err := obj.getDocument(ctx); err == nil && doc != nil {
-		obj.size = parseSize(doc.FileSize)
+	if obj.size == 0 {
+		if doc, err := obj.getDocument(ctx); err == nil && doc != nil {
+			obj.size = parseSize(doc.FileSize)
+		}
 	}
 	return obj, nil
 }

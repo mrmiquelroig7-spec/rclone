@@ -35,3 +35,13 @@ func TestSplitRemotePathHandlesWindowsSeparators(t *testing.T) {
 		}
 	}
 }
+
+func TestCorreosItemUsesSizeFromListPayload(t *testing.T) {
+	var item CorreosItem
+	if err := json.Unmarshal([]byte(`{"size":1234}`), &item); err != nil {
+		t.Fatalf("unmarshal size field: %v", err)
+	}
+	if got := parseSize(item.RawSize); got != 1234 {
+		t.Fatalf("expected size 1234 from list payload, got %d", got)
+	}
+}

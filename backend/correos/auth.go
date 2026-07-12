@@ -2,6 +2,8 @@ package correos
 
 import (
 	"context"
+	"fmt"
+	"net/url"
 
 	"github.com/rclone/rclone/lib/rest"
 )
@@ -25,7 +27,27 @@ func (f *Fs) identityClient() *rest.Client {
 }
 
 func (f *Fs) getRedirectURL(ctx context.Context) (string, error) {
-	return "", nil
+	params := url.Values{}
+	params.Set("applicationOid", appOID)
+
+	opts := rest.Opts{
+		Method:     "GET",
+		Path:       "UtilitiesCorreosId/GetUrlRedirectOauth",
+		Parameters: params,
+	}
+
+	var result []string
+
+	_, err := f.identityClient().CallJSON(ctx, &opts, nil, &result)
+	if err != nil {
+		return "", fmt.Errorf("get redirect URL: %w", err)
+	}
+
+	if len(result) == 0 {
+		return "", fmt.Errorf("empty redirect URL response")
+	}
+
+	return result[0], nil
 }
 
 func (f *Fs) authorize(ctx context.Context, user, pass, redirectURL string) (string, error) {

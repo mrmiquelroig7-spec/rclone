@@ -45,3 +45,30 @@ func TestCorreosItemUsesSizeFromListPayload(t *testing.T) {
 		t.Fatalf("expected size 1234 from list payload, got %d", got)
 	}
 }
+
+func TestNormalizeAuthorizationHeaderAddsBearerPrefix(t *testing.T) {
+	if got := normalizeAuthorizationHeader("eyJhbGciOi..."); got != "Bearer eyJhbGciOi..." {
+		t.Fatalf("expected Bearer prefix, got %q", got)
+	}
+}
+
+func TestNormalizeAuthorizationHeaderKeepsExistingBearer(t *testing.T) {
+	input := "Bearer eyJhbGciOi..."
+	if got := normalizeAuthorizationHeader(input); got != input {
+		t.Fatalf("expected existing Bearer token unchanged, got %q", got)
+	}
+}
+
+func TestNormalizeAuthorizationHeaderHandlesAuthorizationPrefix(t *testing.T) {
+	input := "Authorization: eyJhbGciOi..."
+	if got := normalizeAuthorizationHeader(input); got != "Bearer eyJhbGciOi..." {
+		t.Fatalf("expected Bearer header from Authorization prefix, got %q", got)
+	}
+}
+
+func TestNormalizeAuthorizationHeaderHandlesQuotedValue(t *testing.T) {
+	input := "\"eyJhbGciOi...\""
+	if got := normalizeAuthorizationHeader(input); got != "Bearer eyJhbGciOi..." {
+		t.Fatalf("expected Bearer header from quoted JWT, got %q", got)
+	}
+}

@@ -29,10 +29,21 @@ func init() {
 		Description: "Buzón Digital de Correos",
 		NewFs:       NewFS,
 		Options: []fs.Option{{
-			Name:     "jwt",
-			Help:     "JWT obtenido del localStorage del navegador",
-			Required: true,
-		}},
+			Name:     "user",
+			Help:     "Usuario de Correos",
+			Required: false,
+		},
+			{
+				Name:       "pass",
+				Help:       "Contraseña de Correos",
+				IsPassword: true,
+				Required:   false,
+			},
+			{
+				Name:     "jwt",
+				Help:     "JWT obtenido del localStorage del navegador",
+				Required: true,
+			}},
 	})
 }
 
@@ -46,18 +57,28 @@ type Fs struct {
 	dirCache   map[string]int64
 }
 
+func (f *Fs) Login(ctx context.Context) error {
+	return errors.New("unimplemented")
+}
+
 type Options struct {
+	User string `config:"user"`
+	Pass string `config:"pass"`
+
 	JWT string `config:"jwt"`
 }
 
 func NewFS(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, error) {
-	rawJWT, ok := m.Get("jwt")
-	if !ok || rawJWT == "" {
-		return nil, errors.New("se requiere un jwt válido")
-	}
+	opt := Options{}
 
-	opt := Options{
-		JWT: rawJWT,
+	if v, ok := m.Get("jwt"); ok {
+		opt.JWT = v
+	}
+	if v, ok := m.Get("user"); ok {
+		opt.User = v
+	}
+	if v, ok := m.Get("pass"); ok {
+		opt.Pass = v
 	}
 
 	f := &Fs{
@@ -70,12 +91,30 @@ func NewFS(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 
 	client := &http.Client{Timeout: 60 * time.Second}
 	f.httpClient = client
-	f.srv = rest.NewClient(client).SetRoot("https://buzondigital.correos.es/api/v1.0/")
+
+	f.srv = rest.NewClient(client).
+		SetRoot("https://buzondigital.correos.es/api/v1.0/")
 
 	f.srv.SetHeader("Accept", "application/json, text/plain, */*")
 	f.srv.SetHeader("Origin", "https://buzondigital.correos.es")
 	f.srv.SetHeader("Referer", "https://buzondigital.correos.es/")
-	f.srv.SetHeader("Authorization", opt.JWT)
+
+	switch {
+	case opt.JWT != "":
+		// Development mode with JWT
+		authHeader := normalizeAuthorizationHeader(opt.JWT)
+		f.srv.SetHeader("Authorization", authHeader)
+		f.opt.JWT = authHeader
+
+	case opt.User != "" && opt.Pass != "":
+		// Regular mode with username and password
+		if err := f.Login(ctx); err != nil {
+			return nil, fmt.Errorf("login a Correos: %w", err)
+		}
+
+	default:
+		return nil, errors.New("cal configurar 'jwt' o bé 'user' i 'pass'")
+	}
 
 	return f, nil
 }
@@ -144,6 +183,22 @@ func parseSize(value any) int64 {
 	return 0
 }
 
+func normalizeAuthorizationHeader(jwt string) string {
+	jwt = strings.TrimSpace(strings.Trim(jwt, "\"'"))
+	if jwt == "" {
+		return ""
+	}
+	jwtLower := strings.ToLower(jwt)
+	if strings.HasPrefix(jwtLower, "authorization:") {
+		jwt = strings.TrimSpace(strings.TrimSpace(jwt[len("authorization:"):]))
+		jwtLower = strings.ToLower(jwt)
+	}
+	if strings.HasPrefix(jwtLower, "bearer ") || strings.HasPrefix(jwtLower, "token ") {
+		return jwt
+	}
+	return "Bearer " + jwt
+}
+
 type ListResponse struct {
 	Cursor string        `json:"cursor"`
 	Items  []CorreosItem `json:"items"`
@@ -157,7 +212,9 @@ func (f *Fs) listItems(ctx context.Context, parentID int64) ([]CorreosItem, erro
 		Path: fmt.Sprintf(
 			"/folders/items?parameters.order=desc&parameters.sort=folder_first&parameters.limit=52&parameters.parent=%s",
 			url.QueryEscape(parentStr),
-		)}
+		),
+		AuthRedirect: true,
+	}
 
 	var result ListResponse
 	_, err := f.srv.CallJSON(ctx, &opts, nil, &result)
@@ -431,7 +488,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 func (o *Object) Remove(ctx context.Context) error { return o.fs.deleteObject(ctx, o.remote) }
 
 func (o *Object) getDocument(ctx context.Context) (*DocumentResponse, error) {
-	opts := rest.Opts{Method: http.MethodGet, Path: fmt.Sprintf("/documents/%d", o.id)}
+	opts := rest.Opts{Method: http.MethodGet, Path: fmt.Sprintf("/documents/%d", o.id), AuthRedirect: true}
 	resp, err := o.fs.srv.Call(ctx, &opts)
 	if err != nil {
 		return nil, err
@@ -465,7 +522,8 @@ func (o *Object) openDownloadURL(ctx context.Context, downloadURL string) (io.Re
 		req.Header.Set("Origin", "https://buzondigital.correos.es")
 		req.Header.Set("Referer", "https://buzondigital.correos.es/")
 		req.Header.Set("Authorization", o.fs.opt.JWT)
-		resp, err := o.fs.httpClient.Do(req)
+		client := rest.ClientWithAuthRedirects(o.fs.httpClient)
+		resp, err := client.Do(req)
 		if err != nil {
 			return nil, err
 		}

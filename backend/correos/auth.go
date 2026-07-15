@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"net/url"
 	"strings"
 
@@ -15,7 +17,7 @@ import (
 const (
 	apiIdentity    = "https://apicorreosidservices.correos.es/Api/"
 	oauthIdentity  = "https://apioauthcid.correos.es/Api/"
-	applicationOID = "066a6ffb-c90c-4f3e-98ec-0f56cfa5643e"
+	applicationOID = "a60b83f3-3e1b-4772-88dc-c389e3fdb036"
 )
 
 type OAuthTokens struct {
@@ -108,7 +110,6 @@ func (f *Fs) authorize(ctx context.Context, username, password, redirectURL stri
 	opts := rest.Opts{
 		Method: "POST",
 		Path:   "Authorize?" + params.Encode(),
-		Body:   strings.NewReader(`{"username":"` + username + `","password":"` + password + `"}`),
 		ExtraHeaders: map[string]string{
 			"Accept":          "application/json",
 			"Content-Type":    "application/json",
@@ -124,7 +125,7 @@ func (f *Fs) authorize(ctx context.Context, username, password, redirectURL stri
 		return "", fmt.Errorf("authorize: %w", err)
 	}
 
-	fs.Debugf(f, "Authorization response: %q", response)
+	// fs.Debugf(f, "Authorization response: %q", response)
 
 	return response, nil
 }
@@ -137,7 +138,7 @@ type tokenResponse struct {
 	ExpiresIn    int    `json:"expiresIn"`
 }
 
-func (f *Fs) getToken(ctx context.Context, code, redirectURL string) (string, error) {
+func (f *Fs) getToken(ctx context.Context, code, redirectURL string) (*tokenResponse, error) {
 	form := url.Values{}
 	form.Set("redirect_uri", redirectURL)
 	form.Set("code", code)
@@ -161,19 +162,83 @@ func (f *Fs) getToken(ctx context.Context, code, redirectURL string) (string, er
 
 	_, err := f.oauthClient().CallJSON(ctx, &opts, nil, &response)
 	if err != nil {
-		return "", fmt.Errorf("get token: %w", err)
+		return nil, fmt.Errorf("get token: %w", err)
 	}
 
-	fs.Debugf(f, "Token response: %#v", response)
+	fs.Debugf(f, "Token response: %+v", response)
 	b, _ := json.MarshalIndent(response, "", "  ")
 	fs.Debugf(f, "Token response JSON: \n%s", b)
 
 	if response.IDToken == "" {
-		return "", fmt.Errorf("idToken not found in token response")
+		return nil, fmt.Errorf("idToken not found in token response")
 	}
 
-	return response.IDToken, nil
+	return &response, nil
 
+}
+
+func (f *Fs) jwtLogin(ctx context.Context, token *tokenResponse) (string, error) {
+	body, err := json.Marshal(token)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal token response: %w", err)
+	}
+
+	form := url.Values{}
+	form.Set("body", string(body))
+
+	req, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodPost,
+		"https://buzondigital.correos.es/api/v1.0/auth/jwt-login",
+		strings.NewReader(form.Encode()),
+	)
+	if err != nil {
+		return "", err
+	}
+
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Origin", "https://identidad.correos.es")
+	req.Header.Set("Referer", "https://identidad.correos.es/")
+
+	client := *f.httpClient
+	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer fs.CheckClose(resp.Body, &err)
+
+	if resp.StatusCode != http.StatusFound {
+		b, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf(
+			"jwt-login: unexpected status %d: %s",
+			resp.StatusCode,
+			string(b),
+		)
+	}
+
+	location := resp.Header.Get("Location")
+	if location == "" {
+		return "", fmt.Errorf("jwt-login: missing Location header")
+	}
+
+	u, err := url.Parse(location)
+	if err != nil {
+		return "", fmt.Errorf("jwt-login: invalid redirect URL: %w", err)
+	}
+
+	jwt := u.Query().Get("t")
+	if jwt == "" {
+		return "", fmt.Errorf("jwt-login: missing 't' parameter")
+	}
+
+	fs.Debugf(f, "jwtLogin form=%s", form.Encode())
+
+	return jwt, nil
 }
 
 func (f *Fs) login(ctx context.Context, username, password string) (string, error) {
@@ -192,5 +257,10 @@ func (f *Fs) login(ctx context.Context, username, password string) (string, erro
 		return "", fmt.Errorf("extract authorization code: %w", err)
 	}
 
-	return f.getToken(ctx, code, redirectURL)
+	token, err := f.getToken(ctx, code, redirectURL)
+	if err != nil {
+		return "", fmt.Errorf("login: %w", err)
+	}
+
+	return f.jwtLogin(ctx, token)
 }

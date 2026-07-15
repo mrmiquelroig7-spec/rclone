@@ -238,8 +238,12 @@ func (f *Fs) listItems(ctx context.Context, parentID int64) ([]CorreosItem, erro
 	fs.Debugf(f, "Authorization=%q", f.opt.JWT)
 	fs.Debugf(f, "Path=%q", opts.Path)
 	fs.Debugf(f, "Parameters=%v", opts.Parameters)
-	_, err := f.srv.CallJSON(ctx, &opts, nil, &result)
+	resp, err := f.srv.CallJSON(ctx, &opts, nil, &result)
 	if err != nil {
+		if resp != nil {
+			body, _ := io.ReadAll(resp.Body)
+			fs.Debugf(f, "Status=%d Body=%q", resp.StatusCode, string(body))
+		}
 		return nil, err
 	}
 	return result.Items, nil

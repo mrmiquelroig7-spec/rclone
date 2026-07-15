@@ -30,18 +30,18 @@ func init() {
 		NewFs:       NewFS,
 		Options: []fs.Option{{
 			Name:     "username",
-			Help:     "Usuario de Correos",
+			Help:     "CorreosID user",
 			Required: false,
 		},
 			{
 				Name:       "password",
-				Help:       "Contraseña de Correos",
+				Help:       "CorreosID password",
 				IsPassword: true,
 				Required:   false,
 			},
 			{
 				Name:     "jwt",
-				Help:     "JWT de Correos (opcional; solo para desarrolladores)",
+				Help:     "JWT (developer only)",
 				Required: false,
 				Advanced: true,
 			}},
@@ -189,22 +189,6 @@ func parseSize(value any) int64 {
 	}
 	return 0
 }
-
-/* func normalizeAuthorizationHeader(jwt string) string {
-	jwt = strings.TrimSpace(strings.Trim(jwt, "\"'"))
-	if jwt == "" {
-		return ""
-	}
-	jwtLower := strings.ToLower(jwt)
-	if strings.HasPrefix(jwtLower, "authorization:") {
-		jwt = strings.TrimSpace(strings.TrimSpace(jwt[len("authorization:"):]))
-		jwtLower = strings.ToLower(jwt)
-	}
-	if strings.HasPrefix(jwtLower, "bearer ") || strings.HasPrefix(jwtLower, "token ") {
-		return jwt
-	}
-	return "Bearer " + jwt
-} */
 
 type ListResponse struct {
 	Cursor string        `json:"cursor"`
@@ -386,7 +370,7 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 
 	items, err := f.listItems(ctx, parentID)
 	if err != nil {
-		return nil, fmt.Errorf("error al listar elementos de Correos: %w", err)
+		return nil, fmt.Errorf("error listing Correos elements: %w", err)
 	}
 
 	for _, item := range items {
@@ -473,7 +457,7 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 	return obj, nil
 }
 func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
-	return nil, errors.New("operación Put no implementada")
+	return nil, errors.New("Put operation not implemented")
 }
 func (f *Fs) deleteObject(context.Context, string) error {
 	return nil
@@ -502,7 +486,7 @@ func (o *Object) Hash(ctx context.Context, ty hash.Type) (string, error) {
 }
 func (o *Object) Storable() bool { return true }
 func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
-	return errors.New("operación Update no implementada")
+	return errors.New("Update operation not implemented")
 }
 func (o *Object) Remove(ctx context.Context) error { return o.fs.deleteObject(ctx, o.remote) }
 
@@ -518,7 +502,7 @@ func (o *Object) getDocument(ctx context.Context) (*DocumentResponse, error) {
 		return nil, err
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("error al obtener metadata del archivo (%d): %s", resp.StatusCode, string(body))
+		return nil, fmt.Errorf("error fetching file metadata (%d): %s", resp.StatusCode, string(body))
 	}
 	var doc DocumentResponse
 	if err := json.Unmarshal(body, &doc); err != nil {
@@ -529,7 +513,7 @@ func (o *Object) getDocument(ctx context.Context) (*DocumentResponse, error) {
 
 func (o *Object) openDownloadURL(ctx context.Context, downloadURL string) (io.ReadCloser, error) {
 	if downloadURL == "" {
-		return nil, errors.New("download URL vacía")
+		return nil, errors.New("empty download URL")
 	}
 
 	if strings.HasPrefix(downloadURL, "http://") || strings.HasPrefix(downloadURL, "https://") {
@@ -549,7 +533,7 @@ func (o *Object) openDownloadURL(ctx context.Context, downloadURL string) (io.Re
 		if resp.StatusCode != http.StatusOK {
 			defer resp.Body.Close()
 			body, _ := io.ReadAll(resp.Body)
-			return nil, fmt.Errorf("error al descargar el archivo (%d): %s", resp.StatusCode, string(body))
+			return nil, fmt.Errorf("error downloading file (%d): %s", resp.StatusCode, string(body))
 		}
 		return resp.Body, nil
 	}
@@ -557,12 +541,12 @@ func (o *Object) openDownloadURL(ctx context.Context, downloadURL string) (io.Re
 	opts := rest.Opts{Method: http.MethodGet, Path: downloadURL}
 	resp, err := o.fs.srv.Call(ctx, &opts)
 	if err != nil {
-		return nil, fmt.Errorf("error al descargar el archivo: %w", err)
+		return nil, fmt.Errorf("error downloading file: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
 		defer resp.Body.Close()
 		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("error al descargar el archivo (%d): %s", resp.StatusCode, string(body))
+		return nil, fmt.Errorf("error downloading file (%d): %s", resp.StatusCode, string(body))
 	}
 	return resp.Body, nil
 }
@@ -570,7 +554,7 @@ func (o *Object) openDownloadURL(ctx context.Context, downloadURL string) (io.Re
 func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
 	doc, err := o.getDocument(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("error al obtener metadata del archivo: %w", err)
+		return nil, fmt.Errorf("error fetching file metadata: %w", err)
 	}
 	if doc != nil && doc.DownloadUrl != "" {
 		return o.openDownloadURL(ctx, doc.DownloadUrl)
@@ -598,5 +582,5 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 		return resp.Body, nil
 	}
 
-	return nil, fmt.Errorf("error al descargar el archivo: no se encontró un endpoint válido")
+	return nil, fmt.Errorf("error downloading file: unable to find valid endpoint")
 }

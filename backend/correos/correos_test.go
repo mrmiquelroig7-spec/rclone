@@ -1,8 +1,14 @@
 package correos
 
 import (
+	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"testing"
+
+	"github.com/rclone/rclone/lib/rest"
 )
 
 func TestCorreosItemDisplayNameFallsBackToEitherField(t *testing.T) {
@@ -46,29 +52,48 @@ func TestCorreosItemUsesSizeFromListPayload(t *testing.T) {
 	}
 }
 
-func TestNormalizeAuthorizationHeaderAddsBearerPrefix(t *testing.T) {
-	if got := normalizeAuthorizationHeader("eyJhbGciOi..."); got != "Bearer eyJhbGciOi..." {
-		t.Fatalf("expected Bearer prefix, got %q", got)
-	}
-}
+func TestListItemsBuildsExpectedPathAndQuery(t *testing.T) {
+	var gotPath string
+	var gotQuery url.Values
 
-func TestNormalizeAuthorizationHeaderKeepsExistingBearer(t *testing.T) {
-	input := "Bearer eyJhbGciOi..."
-	if got := normalizeAuthorizationHeader(input); got != input {
-		t.Fatalf("expected existing Bearer token unchanged, got %q", got)
-	}
-}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotQuery = r.URL.Query()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(ListResponse{Items: []CorreosItem{}})
+	}))
+	defer server.Close()
 
-func TestNormalizeAuthorizationHeaderHandlesAuthorizationPrefix(t *testing.T) {
-	input := "Authorization: eyJhbGciOi..."
-	if got := normalizeAuthorizationHeader(input); got != "Bearer eyJhbGciOi..." {
-		t.Fatalf("expected Bearer header from Authorization prefix, got %q", got)
-	}
-}
+	client := &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		if req.URL.Host == "buzondigital.correos.es" {
+			req.URL.Scheme = "http"
+			req.URL.Host = server.Listener.Addr().String()
+		}
+		return http.DefaultTransport.RoundTrip(req)
+	})}
 
-func TestNormalizeAuthorizationHeaderHandlesQuotedValue(t *testing.T) {
-	input := "\"eyJhbGciOi...\""
-	if got := normalizeAuthorizationHeader(input); got != "Bearer eyJhbGciOi..." {
-		t.Fatalf("expected Bearer header from quoted JWT, got %q", got)
+	f := &Fs{httpClient: client}
+	f.srv = rest.NewClient(client)
+	f.srv.SetRoot("https://buzondigital.correos.es/api/v1.0/")
+
+	_, err := f.listItems(context.Background(), 0)
+	if err != nil {
+		t.Fatalf("listItems returned error: %v", err)
+	}
+
+	if gotPath != "/api/v1.0/folders/items" && gotPath != "/folders/items" {
+		t.Fatalf("unexpected path: %q", gotPath)
+	}
+	if gotQuery.Get("parameters.order") != "desc" {
+		t.Fatalf("unexpected parameters.order: %q", gotQuery.Get("parameters.order"))
+	}
+	if gotQuery.Get("parameters.sort") != "folder_first" {
+		t.Fatalf("unexpected parameters.sort: %q", gotQuery.Get("parameters.sort"))
+	}
+	if gotQuery.Get("parameters.limit") != "52" {
+		t.Fatalf("unexpected parameters.limit: %q", gotQuery.Get("parameters.limit"))
+	}
+	if gotQuery.Get("parameters.parent") != "0" {
+		t.Fatalf("unexpected parameters.parent: %q", gotQuery.Get("parameters.parent"))
 	}
 }

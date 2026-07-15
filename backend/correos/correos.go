@@ -29,20 +29,21 @@ func init() {
 		Description: "Buzón Digital de Correos",
 		NewFs:       NewFS,
 		Options: []fs.Option{{
-			Name:     "user",
+			Name:     "username",
 			Help:     "Usuario de Correos",
 			Required: false,
 		},
 			{
-				Name:       "pass",
+				Name:       "password",
 				Help:       "Contraseña de Correos",
 				IsPassword: true,
 				Required:   false,
 			},
 			{
 				Name:     "jwt",
-				Help:     "JWT obtenido del localStorage del navegador",
-				Required: true,
+				Help:     "JWT de Correos (opcional; solo para desarrolladores)",
+				Required: false,
+				Advanced: true,
 			}},
 	})
 }
@@ -58,14 +59,21 @@ type Fs struct {
 }
 
 func (f *Fs) Login(ctx context.Context) error {
-	return errors.New("unimplemented")
+	jwt, err := f.login(ctx, f.opt.Username, f.opt.Password)
+	if err != nil {
+		return err
+	}
+
+	f.opt.JWT = jwt
+	f.srv.SetHeader("Authorization", jwt)
+
+	return nil
 }
 
 type Options struct {
-	User string `config:"user"`
-	Pass string `config:"pass"`
-
-	JWT string `config:"jwt"`
+	Username string `config:"username"`
+	Password string `config:"password"`
+	JWT      string `config:"jwt"`
 }
 
 func NewFS(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, error) {
@@ -74,11 +82,11 @@ func NewFS(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	if v, ok := m.Get("jwt"); ok {
 		opt.JWT = v
 	}
-	if v, ok := m.Get("user"); ok {
-		opt.User = v
+	if v, ok := m.Get("username"); ok {
+		opt.Username = v
 	}
-	if v, ok := m.Get("pass"); ok {
-		opt.Pass = v
+	if v, ok := m.Get("password"); ok {
+		opt.Password = v
 	}
 
 	f := &Fs{
@@ -101,19 +109,18 @@ func NewFS(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 
 	switch {
 	case opt.JWT != "":
-		// Development mode with JWT
-		authHeader := normalizeAuthorizationHeader(opt.JWT)
-		f.srv.SetHeader("Authorization", authHeader)
-		f.opt.JWT = authHeader
+		// Use configured JWT if available
+		f.srv.SetHeader("Authorization", opt.JWT)
+		f.opt.JWT = opt.JWT
 
-	case opt.User != "" && opt.Pass != "":
+	case opt.Username != "" && opt.Password != "":
 		// Regular mode with username and password
 		if err := f.Login(ctx); err != nil {
-			return nil, fmt.Errorf("login a Correos: %w", err)
+			return nil, fmt.Errorf("login failed: %w", err)
 		}
 
 	default:
-		return nil, errors.New("cal configurar 'jwt' o bé 'user' i 'pass'")
+		return nil, errors.New("configure either 'jwt' or 'username' and 'password'")
 	}
 
 	return f, nil
@@ -183,7 +190,7 @@ func parseSize(value any) int64 {
 	return 0
 }
 
-func normalizeAuthorizationHeader(jwt string) string {
+/* func normalizeAuthorizationHeader(jwt string) string {
 	jwt = strings.TrimSpace(strings.Trim(jwt, "\"'"))
 	if jwt == "" {
 		return ""
@@ -197,7 +204,7 @@ func normalizeAuthorizationHeader(jwt string) string {
 		return jwt
 	}
 	return "Bearer " + jwt
-}
+} */
 
 type ListResponse struct {
 	Cursor string        `json:"cursor"`
@@ -209,14 +216,28 @@ func (f *Fs) listItems(ctx context.Context, parentID int64) ([]CorreosItem, erro
 
 	opts := rest.Opts{
 		Method: "GET",
-		Path: fmt.Sprintf(
-			"/folders/items?parameters.order=desc&parameters.sort=folder_first&parameters.limit=52&parameters.parent=%s",
-			url.QueryEscape(parentStr),
-		),
-		AuthRedirect: true,
+		Path:   "folders/items",
+		Parameters: url.Values{
+			"parameters.order":  {"desc"},
+			"parameters.sort":   {"folder_first"},
+			"parameters.limit":  {"52"},
+			"parameters.parent": {parentStr},
+		},
+		ExtraHeaders: map[string]string{
+			"Accept":          "application/json, text/plain, */*",
+			"Accept-Encoding": "gzip, deflate, br, zstd",
+			"Accept-Language": "es-ES,es;q=0.9,ca;q=0.8,en-US;q=0.7,en;q=0.6",
+			"Authorization":   f.opt.JWT,
+			"Host":            "buzondigital.correos.es",
+			"Referer":         "https://buzondigital.correos.es/",
+			"Connection":      "keep-alive",
+		},
 	}
 
 	var result ListResponse
+	fs.Debugf(f, "Authorization=%q", f.opt.JWT)
+	fs.Debugf(f, "Path=%q", opts.Path)
+	fs.Debugf(f, "Parameters=%v", opts.Parameters)
 	_, err := f.srv.CallJSON(ctx, &opts, nil, &result)
 	if err != nil {
 		return nil, err
@@ -488,7 +509,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 func (o *Object) Remove(ctx context.Context) error { return o.fs.deleteObject(ctx, o.remote) }
 
 func (o *Object) getDocument(ctx context.Context) (*DocumentResponse, error) {
-	opts := rest.Opts{Method: http.MethodGet, Path: fmt.Sprintf("/documents/%d", o.id), AuthRedirect: true}
+	opts := rest.Opts{Method: http.MethodGet, Path: fmt.Sprintf("documents/%d", o.id), AuthRedirect: true}
 	resp, err := o.fs.srv.Call(ctx, &opts)
 	if err != nil {
 		return nil, err
@@ -558,14 +579,15 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 	}
 
 	candidates := []string{
-		fmt.Sprintf("/files/%d", o.id),
-		fmt.Sprintf("/documents/%d", o.id),
-		fmt.Sprintf("/files/%d/download", o.id),
-		fmt.Sprintf("/files/download/%d", o.id),
-		fmt.Sprintf("/documents/%d/download", o.id),
+		fmt.Sprintf("files/%d", o.id),
+		fmt.Sprintf("documents/%d", o.id),
+		fmt.Sprintf("files/%d/download", o.id),
+		fmt.Sprintf("files/download/%d", o.id),
+		fmt.Sprintf("documents/%d/download", o.id),
 	}
 
 	for _, candidate := range candidates {
+		candidate = strings.TrimPrefix(candidate, "/")
 		opts := rest.Opts{Method: http.MethodGet, Path: candidate}
 		resp, err := o.fs.srv.Call(ctx, &opts)
 		if err != nil {

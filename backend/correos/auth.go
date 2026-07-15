@@ -125,8 +125,6 @@ func (f *Fs) authorize(ctx context.Context, username, password, redirectURL stri
 		return "", fmt.Errorf("authorize: %w", err)
 	}
 
-	// fs.Debugf(f, "Authorization response: %q", response)
-
 	return response, nil
 }
 
@@ -165,10 +163,6 @@ func (f *Fs) getToken(ctx context.Context, code, redirectURL string) (*tokenResp
 		return nil, fmt.Errorf("get token: %w", err)
 	}
 
-	fs.Debugf(f, "Token response: %+v", response)
-	b, _ := json.MarshalIndent(response, "", "  ")
-	fs.Debugf(f, "Token response JSON: \n%s", b)
-
 	if response.IDToken == "" {
 		return nil, fmt.Errorf("idToken not found in token response")
 	}
@@ -177,6 +171,13 @@ func (f *Fs) getToken(ctx context.Context, code, redirectURL string) (*tokenResp
 
 }
 
+// Correos OAuth returns a CID idToken (RS256), which cannot be used
+// directly against the Buzón Digital API.
+//
+// The idToken must be exchanged through /api/v1.0/auth/jwt-login,
+// which redirects to /auth/access?t=<JWT>.
+//
+// The 't' parameter is the JWT accepted by the Buzón Digital API.
 func (f *Fs) jwtLogin(ctx context.Context, token *tokenResponse) (string, error) {
 	body, err := json.Marshal(token)
 	if err != nil {
@@ -235,8 +236,6 @@ func (f *Fs) jwtLogin(ctx context.Context, token *tokenResponse) (string, error)
 	if jwt == "" {
 		return "", fmt.Errorf("jwt-login: missing 't' parameter")
 	}
-
-	fs.Debugf(f, "jwtLogin form=%s", form.Encode())
 
 	return jwt, nil
 }

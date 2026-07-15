@@ -235,14 +235,11 @@ func (f *Fs) listItems(ctx context.Context, parentID int64) ([]CorreosItem, erro
 	}
 
 	var result ListResponse
-	fs.Debugf(f, "Authorization=%q", f.opt.JWT)
-	fs.Debugf(f, "Path=%q", opts.Path)
-	fs.Debugf(f, "Parameters=%v", opts.Parameters)
+
 	resp, err := f.srv.CallJSON(ctx, &opts, nil, &result)
 	if err != nil {
 		if resp != nil {
-			body, _ := io.ReadAll(resp.Body)
-			fs.Debugf(f, "Status=%d Body=%q", resp.StatusCode, string(body))
+			_, _ = io.ReadAll(resp.Body)
 		}
 		return nil, err
 	}
@@ -391,9 +388,6 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 	if err != nil {
 		return nil, fmt.Errorf("error al listar elementos de Correos: %w", err)
 	}
-
-	fs.Debugf(f, "List(%q): parentID=%d", dir, parentID)
-	fs.Debugf(f, "List(%q): received %d items", dir, len(items))
 
 	for _, item := range items {
 		displayName := item.DisplayName()

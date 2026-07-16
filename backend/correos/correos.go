@@ -517,35 +517,46 @@ func (o *Object) openDownloadURL(ctx context.Context, downloadURL string) (io.Re
 	}
 
 	if strings.HasPrefix(downloadURL, "http://") || strings.HasPrefix(downloadURL, "https://") {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, downloadURL, nil)
+		u, err := url.Parse(downloadURL)
 		if err != nil {
 			return nil, err
 		}
-		req.Header.Set("Accept", "application/json, text/plain, */*")
-		req.Header.Set("Origin", "https://buzondigital.correos.es")
-		req.Header.Set("Referer", "https://buzondigital.correos.es/")
-		req.Header.Set("Authorization", o.fs.opt.JWT)
-		client := rest.ClientWithAuthRedirects(o.fs.httpClient)
-		resp, err := client.Do(req)
-		if err != nil {
-			return nil, err
+
+		path := strings.TrimPrefix(u.Path, "/api/v1.0/")
+
+		opts := rest.Opts{
+			Method: http.MethodGet,
+			Path:   path,
 		}
+
+		resp, err := o.fs.srv.Call(ctx, &opts)
+		if err != nil {
+			return nil, fmt.Errorf("error downloading file: %w", err)
+		}
+
 		if resp.StatusCode != http.StatusOK {
-			defer resp.Body.Close()
 			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
 			return nil, fmt.Errorf("error downloading file (%d): %s", resp.StatusCode, string(body))
 		}
+
 		return resp.Body, nil
 	}
 
-	opts := rest.Opts{Method: http.MethodGet, Path: downloadURL}
+	opts := rest.Opts{
+		Method:       http.MethodGet,
+		Path:         downloadURL,
+		AuthRedirect: true,
+	}
+
 	resp, err := o.fs.srv.Call(ctx, &opts)
 	if err != nil {
 		return nil, fmt.Errorf("error downloading file: %w", err)
 	}
+
 	if resp.StatusCode != http.StatusOK {
-		defer resp.Body.Close()
 		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
 		return nil, fmt.Errorf("error downloading file (%d): %s", resp.StatusCode, string(body))
 	}
 	return resp.Body, nil
@@ -556,6 +567,7 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 	if err != nil {
 		return nil, fmt.Errorf("error fetching file metadata: %w", err)
 	}
+
 	if doc != nil && doc.DownloadUrl != "" {
 		return o.openDownloadURL(ctx, doc.DownloadUrl)
 	}

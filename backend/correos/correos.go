@@ -20,8 +20,12 @@ import (
 	"github.com/rclone/rclone/lib/rest"
 )
 
-var _ fs.Fs = (*Fs)(nil)
-var _ fs.Object = (*Object)(nil)
+var (
+	_ fs.Fs     = (*Fs)(nil)
+	_ fs.Object = (*Object)(nil)
+	_ fs.Purger = (*Fs)(nil)
+	// _ fs.PutStreamer = (*Fs)(nil)
+)
 
 func init() {
 	fs.Register(&fs.RegInfo{
@@ -56,6 +60,7 @@ type Fs struct {
 	httpClient *http.Client
 	mu         sync.Mutex // Protects dirCache
 	dirCache   map[string]int64
+	features   *fs.Features
 }
 
 func (f *Fs) Login(ctx context.Context) error {
@@ -95,7 +100,10 @@ func NewFS(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		opt:      opt,
 		dirCache: make(map[string]int64),
 	}
+
 	f.dirCache[""] = 0
+
+	f.features = (&fs.Features{}).Fill(ctx, f)
 
 	client := &http.Client{Timeout: 60 * time.Second}
 	f.httpClient = client
@@ -244,6 +252,7 @@ func splitRemotePath(remote string) []string {
 }
 
 func (f *Fs) resolvePath(remote string) string {
+	fs.Debugf(f, "resolvePath: remote=%q root=%q", remote, f.root)
 	remote = strings.ReplaceAll(strings.TrimSpace(remote), `\`, "/")
 	root := strings.ReplaceAll(strings.TrimSpace(f.root), `\`, "/")
 	if remote == "" {
@@ -255,8 +264,10 @@ func (f *Fs) resolvePath(remote string) string {
 	return path.Join(root, remote)
 }
 
-func (f *Fs) resolveParentID(ctx context.Context, dir string) (int64, error) {
+func (f *Fs) resolveFolderID(ctx context.Context, dir string) (int64, error) {
+	fs.Debugf(f, "resolveFolderID: input=%q", dir)
 	dir = f.resolvePath(dir)
+	fs.Debugf(f, "resolveFolderID: resolved=%q", dir)
 	if dir == "" {
 		return 0, nil
 	}
@@ -322,6 +333,67 @@ func (f *Fs) resolveParentID(ctx context.Context, dir string) (int64, error) {
 	return currentID, nil
 }
 
+func (f *Fs) resolveAbsoluteFolderID(ctx context.Context, dir string) (int64, error) {
+	fs.Debugf(f, "resolveAbsoluteFolderID: input=%q", dir)
+
+	dir = strings.Trim(dir, "/")
+	if dir == "" {
+		return 0, nil
+	}
+
+	currentID := int64(0)
+	currentPath := ""
+
+	parts := splitRemotePath(dir)
+	for idx, part := range parts {
+		if part == "" {
+			continue
+		}
+
+		items, err := f.listItems(ctx, currentID)
+		if err != nil {
+			return 0, err
+		}
+
+		found := false
+
+		for _, item := range items {
+			if !strings.EqualFold(item.DisplayName(), part) {
+				continue
+			}
+
+			if !strings.EqualFold(strings.ToLower(item.Type), "folder") {
+				continue
+			}
+
+			currentID = item.ID
+			found = true
+
+			if currentPath == "" {
+				currentPath = part
+			} else {
+				currentPath += "/" + part
+			}
+
+			f.mu.Lock()
+			f.dirCache[currentPath] = currentID
+			f.mu.Unlock()
+
+			if idx == len(parts)-1 {
+				return currentID, nil
+			}
+
+			break
+		}
+
+		if !found {
+			return 0, fs.ErrorDirNotFound
+		}
+	}
+
+	return currentID, nil
+}
+
 func (f *Fs) resolveItem(ctx context.Context, remote string) (*CorreosItem, error) {
 	remote = f.resolvePath(remote)
 	parts := splitRemotePath(remote)
@@ -363,7 +435,7 @@ func (f *Fs) resolveItem(ctx context.Context, remote string) (*CorreosItem, erro
 }
 
 func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err error) {
-	parentID, err := f.resolveParentID(ctx, dir)
+	parentID, err := f.resolveFolderID(ctx, dir)
 	if err != nil {
 		return nil, err
 	}
@@ -418,14 +490,207 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 	return entries, nil
 }
 
-func (f *Fs) String() string                              { return f.name + ":" + f.root }
-func (f *Fs) Name() string                                { return f.name }
-func (f *Fs) Root() string                                { return f.root }
-func (f *Fs) Precision() time.Duration                    { return fs.ModTimeNotSupported }
-func (f *Fs) Mkdir(ctx context.Context, dir string) error { return nil }
-func (f *Fs) Rmdir(ctx context.Context, dir string) error { return nil }
-func (f *Fs) Features() *fs.Features                      { return &fs.Features{} }
-func (f *Fs) Hashes() hash.Set                            { return hash.Set(hash.None) }
+func (f *Fs) String() string           { return f.name + ":" + f.root }
+func (f *Fs) Name() string             { return f.name }
+func (f *Fs) Root() string             { return f.root }
+func (f *Fs) Precision() time.Duration { return fs.ModTimeNotSupported }
+
+func (f *Fs) Mkdir(ctx context.Context, dir string) error {
+	if dir == "" {
+		dir = f.root
+	}
+
+	parent := path.Dir(dir)
+	if parent == "." {
+		parent = ""
+	}
+
+	var (
+		parentID int64
+		err      error
+	)
+
+	if parent == "" {
+		parentID = 0
+	} else {
+		parentID, err = f.resolveAbsoluteFolderID(ctx, parent)
+		if err != nil {
+			return err
+		}
+	}
+
+	name := path.Base(dir)
+
+	req := map[string]string{
+		"name": name,
+	}
+
+	var result FolderResponse
+
+	opts := rest.Opts{
+		Method: http.MethodPost,
+		Path:   fmt.Sprintf("folders/%d", parentID),
+	}
+
+	_, err = f.srv.CallJSON(ctx, &opts, &req, &result)
+
+	if err != nil {
+		return err
+	}
+
+	f.mu.Lock()
+	f.dirCache[dir] = result.ID
+	f.mu.Unlock()
+
+	return nil
+}
+
+func (f *Fs) deleteFolder(ctx context.Context, dir string, deleteContent bool) error {
+	if dir == f.root {
+		dir = ""
+	}
+
+	id, err := f.resolveFolderID(ctx, dir)
+	if err != nil {
+		return err
+	}
+
+	opts := rest.Opts{
+		Method: http.MethodDelete,
+		Path:   fmt.Sprintf("folders/%d", id),
+		Parameters: url.Values{
+			"deleteContent": []string{strconv.FormatBool(deleteContent)},
+		},
+	}
+
+	var result bool
+	_, err = f.srv.CallJSON(ctx, &opts, nil, &result)
+	if err != nil {
+		return err
+	}
+
+	if !result {
+		return errors.New("folder deletion failed")
+	}
+
+	f.mu.Lock()
+	delete(f.dirCache, dir)
+	f.mu.Unlock()
+
+	return nil
+}
+
+func (f *Fs) Rmdir(ctx context.Context, dir string) error { return f.deleteFolder(ctx, dir, false) }
+func (f *Fs) Purge(ctx context.Context, dir string) error { return f.deleteFolder(ctx, dir, true) }
+
+func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string) error {
+	fs.Debugf(f, "DirMove: %q -> %q", srcRemote, dstRemote)
+
+	srcFs, ok := src.(*Fs)
+	if !ok {
+		return fs.ErrorCantDirMove
+	}
+
+	srcDir := path.Join(srcFs.root, srcRemote)
+	dstDir := path.Join(f.root, dstRemote)
+
+	fs.Debugf(f, "DirMove: srcDir=%q dstDir=%q", srcDir, dstDir)
+
+	srcID, err := srcFs.resolveAbsoluteFolderID(ctx, srcDir)
+	if err != nil {
+		return err
+	}
+
+	dstID, err := f.resolveAbsoluteFolderID(ctx, dstDir)
+
+	if err == nil {
+		if err := f.moveFolder(ctx, srcID, dstID); err != nil {
+			return err
+		}
+	} else if errors.Is(err, fs.ErrorDirNotFound) {
+
+		dstParent := path.Dir(dstDir)
+		if dstParent == "." {
+			dstParent = ""
+		}
+
+		parentID, err := f.resolveAbsoluteFolderID(ctx, dstParent)
+		if err != nil {
+			return err
+		}
+
+		if err := f.moveFolder(ctx, srcID, parentID); err != nil {
+			return err
+		}
+
+		dstName := path.Base(dstDir)
+		if dstName != "." && dstName != "" {
+			if err := f.renameFolder(ctx, srcID, dstName); err != nil {
+				return err
+			}
+		}
+	} else {
+		return err
+	}
+
+	finalDir := dstDir
+
+	if err == nil {
+		finalDir = path.Join(dstDir, path.Base(srcDir))
+	}
+
+	f.mu.Lock()
+	delete(f.dirCache, srcDir)
+	f.dirCache[finalDir] = srcID
+	f.mu.Unlock()
+
+	return nil
+}
+
+func (f *Fs) moveFolder(ctx context.Context, id, parentID int64) error {
+	fs.Debugf(f, "moveFolder: id=%d parentID=%d", id, parentID)
+	req := map[string]int64{
+		"parentId": parentID,
+	}
+
+	var result FolderResponse
+
+	opts := rest.Opts{
+		Method: http.MethodPost,
+		Path:   fmt.Sprintf("folders/%d/move", id),
+	}
+
+	_, err := f.srv.CallJSON(ctx, &opts, &req, &result)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (f *Fs) renameFolder(ctx context.Context, id int64, name string) error {
+	fs.Debugf(f, "renameFolder: id=%d name=%q", id, name)
+	req := map[string]string{
+		"name": name,
+	}
+
+	var result FolderResponse
+
+	opts := rest.Opts{
+		Method: http.MethodPost,
+		Path:   fmt.Sprintf("folders/%d/rename", id),
+	}
+
+	_, err := f.srv.CallJSON(ctx, &opts, &req, &result)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (f *Fs) Features() *fs.Features { return f.features }
+func (f *Fs) Hashes() hash.Set       { return hash.Set(hash.None) }
 func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 	item, err := f.resolveItem(ctx, remote)
 	if err != nil {

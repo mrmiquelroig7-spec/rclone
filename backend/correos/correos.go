@@ -35,6 +35,10 @@ var (
 			Name:  "delete_permanently",
 			Short: "Permanently delete a document from the trash by its ID",
 		},
+		{
+			Name:  "share_to_email",
+			Short: "Share a document by email (args: document-id email)",
+		},
 	}
 )
 
@@ -43,6 +47,7 @@ func init() {
 		Name:        "correos",
 		Description: "Buzón Digital de Correos",
 		NewFs:       NewFS,
+		CommandHelp: commandHelp,
 		Options: []fs.Option{
 			{
 				Name:     "username",
@@ -274,6 +279,23 @@ func (f *Fs) Command(ctx context.Context, name string, arg []string, opt map[str
 		}
 
 		return nil, f.deleteDocumentPermanently(ctx, id)
+
+	case "share_to_email":
+		if len(arg) != 2 {
+			return nil, errors.New("usage: rclone backend share_to_email remote: document-id email")
+		}
+
+		id, err := strconv.ParseInt(arg[0], 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("invalid document ID %q: %w", arg[0], err)
+		}
+
+		email := strings.TrimSpace(arg[1])
+		if email == "" {
+			return nil, errors.New("email cannot be empty")
+		}
+
+		return nil, f.shareDocumentByEmail(ctx, id, email)
 	}
 
 	return nil, fs.ErrorCommandNotFound
@@ -1029,6 +1051,43 @@ func (f *Fs) deleteDocumentPermanently(ctx context.Context, id int64) error {
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("permanent delete failed (%d): %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	return nil
+}
+
+func (f *Fs) shareDocumentByEmail(ctx context.Context, id int64, email string) error {
+	params := url.Values{}
+	params.Set("email", email)
+	contentLength := int64(0)
+
+	opts := rest.Opts{
+		Method:        http.MethodPost,
+		Path:          fmt.Sprintf("sharing/%d/share-to-email", id),
+		Parameters:    params,
+		ContentLength: &contentLength,
+		ExtraHeaders: map[string]string{
+			"Cache-Control": "no-cache",
+			"Pragma":        "no-cache",
+			"Referer":       "https://buzondigital.correos.es/",
+		},
+	}
+
+	resp, err := f.srv.Call(ctx, &opts)
+	if err != nil {
+		return err
+	}
+	defer fs.CheckClose(resp.Body, &err)
+
+	body, _ := io.ReadAll(resp.Body)
+	bodyText := strings.TrimSpace(string(body))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("share to email failed (%d): %s", resp.StatusCode, bodyText)
+	}
+
+	// API returns literal true on success.
+	if bodyText != "" && bodyText != "true" {
+		return fmt.Errorf("unexpected share response: %s", bodyText)
 	}
 
 	return nil

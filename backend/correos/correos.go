@@ -131,6 +131,26 @@ func NewFS(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		return nil, errors.New("configure either 'jwt' or 'username' and 'password'")
 	}
 
+	if f.root != "" {
+		_, err := f.resolveAbsoluteFolderID(ctx, f.root)
+		switch {
+		case err == nil:
+			return f, nil
+		case !errors.Is(err, fs.ErrorDirNotFound):
+			return nil, err
+		}
+
+		if _, err := f.NewObject(ctx, ""); err == nil {
+			f.root = path.Dir(f.root)
+			if f.root == "." {
+				f.root = ""
+			}
+			return f, fs.ErrorIsFile
+		} else if !errors.Is(err, fs.ErrorObjectNotFound) {
+			return nil, err
+		}
+	}
+
 	return f, nil
 }
 
@@ -689,6 +709,84 @@ func (f *Fs) renameFolder(ctx context.Context, id int64, name string) error {
 	return nil
 }
 
+func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object, error) {
+	srcObj, ok := src.(*Object)
+	if !ok {
+		return nil, fs.ErrorCantMove
+	}
+
+	srcDir := path.Dir(path.Join(srcObj.fs.root, srcObj.remote))
+	dstDir := path.Dir(path.Join(f.root, remote))
+
+	if srcDir == "." {
+		srcDir = ""
+	}
+	if dstDir == "." {
+		dstDir = ""
+	}
+
+	if srcDir != dstDir {
+		parentID, err := f.resolveAbsoluteFolderID(ctx, dstDir)
+		if err != nil {
+			return nil, err
+		}
+
+		if parentID == 0 {
+			return nil, errors.New("moving files to root folder is not supported")
+		}
+
+		if err := f.moveDocument(ctx, srcObj.id, parentID); err != nil {
+			return nil, err
+		}
+	}
+
+	srcName := path.Base(srcObj.remote)
+	dstName := path.Base(remote)
+
+	if srcName != dstName {
+		if err := f.renameDocument(ctx, srcObj.id, dstName); err != nil {
+			return nil, err
+		}
+	}
+
+	srcObj.fs = f
+	srcObj.remote = remote
+
+	return srcObj, nil
+}
+
+func (f *Fs) moveDocument(ctx context.Context, id, parentID int64) error {
+	req := map[string]int64{
+		"parent": parentID,
+	}
+
+	var result DocumentResponse
+
+	opts := rest.Opts{
+		Method: http.MethodPost,
+		Path:   fmt.Sprintf("documents/%d/move", id),
+	}
+
+	_, err := f.srv.CallJSON(ctx, &opts, &req, &result)
+	return err
+}
+
+func (f *Fs) renameDocument(ctx context.Context, id int64, title string) error {
+	req := map[string]string{
+		"title": title,
+	}
+
+	var result DocumentResponse
+
+	opts := rest.Opts{
+		Method: http.MethodPost,
+		Path:   fmt.Sprintf("documents/%d/rename", id),
+	}
+
+	_, err := f.srv.CallJSON(ctx, &opts, &req, &result)
+	return err
+}
+
 func (f *Fs) Features() *fs.Features { return f.features }
 func (f *Fs) Hashes() hash.Set       { return hash.Set(hash.None) }
 func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
@@ -707,7 +805,7 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 
 	obj := &Object{
 		fs:      f,
-		remote:  route,
+		remote:  remote,
 		id:      item.ID,
 		doc:     item,
 		size:    parseSize(item.RawSize),

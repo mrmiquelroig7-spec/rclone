@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
 	"net/url"
 	"path"
@@ -25,6 +26,16 @@ var (
 	_ fs.Object = (*Object)(nil)
 	_ fs.Purger = (*Fs)(nil)
 	// _ fs.PutStreamer = (*Fs)(nil)
+	commandHelp = []fs.CommandHelp{
+		{
+			Name:  "restore",
+			Short: "Restore a document from the trash by its ID",
+		},
+		{
+			Name:  "delete_permanently",
+			Short: "Permanently delete a document from the trash by its ID",
+		},
+	}
 )
 
 func init() {
@@ -32,11 +43,12 @@ func init() {
 		Name:        "correos",
 		Description: "Buzón Digital de Correos",
 		NewFs:       NewFS,
-		Options: []fs.Option{{
-			Name:     "username",
-			Help:     "CorreosID user",
-			Required: false,
-		},
+		Options: []fs.Option{
+			{
+				Name:     "username",
+				Help:     "CorreosID user",
+				Required: false,
+			},
 			{
 				Name:       "password",
 				Help:       "CorreosID password",
@@ -48,7 +60,14 @@ func init() {
 				Help:     "JWT (developer only)",
 				Required: false,
 				Advanced: true,
-			}},
+			},
+			{
+				Name:     "trashed_only",
+				Help:     "List only documents in the trash",
+				Default:  false,
+				Advanced: true,
+			},
+		},
 	})
 }
 
@@ -76,9 +95,10 @@ func (f *Fs) Login(ctx context.Context) error {
 }
 
 type Options struct {
-	Username string `config:"username"`
-	Password string `config:"password"`
-	JWT      string `config:"jwt"`
+	Username    string `config:"username"`
+	Password    string `config:"password"`
+	JWT         string `config:"jwt"`
+	TrashedOnly bool
 }
 
 func NewFS(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, error) {
@@ -92,6 +112,13 @@ func NewFS(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	}
 	if v, ok := m.Get("password"); ok {
 		opt.Password = v
+	}
+	if v, ok := m.Get("trashed_only"); ok {
+		parsed, err := strconv.ParseBool(v)
+		if err != nil {
+			return nil, fmt.Errorf("invalid trashed_only value %q: %w", v, err)
+		}
+		opt.TrashedOnly = parsed
 	}
 
 	f := &Fs{
@@ -180,6 +207,7 @@ func (i CorreosItem) DisplayName() string {
 
 type DocumentResponse struct {
 	ID          int64  `json:"id"`
+	Name        string `json:"name"`
 	FileName    string `json:"fileName"`
 	Extension   string `json:"extension"`
 	FileSize    any    `json:"fileSize"`
@@ -216,6 +244,39 @@ func parseSize(value any) int64 {
 		}
 	}
 	return 0
+}
+
+func (f *Fs) Command(ctx context.Context, name string, arg []string, opt map[string]string) (out interface{}, err error) {
+	switch name {
+	case "help":
+		return commandHelp, nil
+
+	case "restore":
+		if len(arg) != 1 {
+			return nil, errors.New("usage: rclone backend restore remote: document-id")
+		}
+
+		id, err := strconv.ParseInt(arg[0], 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("invalid document ID %q: %w", arg[0], err)
+		}
+
+		return nil, f.restoreDocument(ctx, id)
+
+	case "delete_permanently":
+		if len(arg) != 1 {
+			return nil, errors.New("usage: rclone backend delete_permanently remote: document-id")
+		}
+
+		id, err := strconv.ParseInt(arg[0], 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("invalid document ID %q: %w", arg[0], err)
+		}
+
+		return nil, f.deleteDocumentPermanently(ctx, id)
+	}
+
+	return nil, fs.ErrorCommandNotFound
 }
 
 type ListResponse struct {
@@ -455,6 +516,12 @@ func (f *Fs) resolveItem(ctx context.Context, remote string) (*CorreosItem, erro
 }
 
 func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err error) {
+	fs.Debugf(f, "List: trashed_only=%v", f.opt.TrashedOnly)
+
+	if f.opt.TrashedOnly {
+		return f.listTrash(ctx)
+	}
+
 	parentID, err := f.resolveFolderID(ctx, dir)
 	if err != nil {
 		return nil, err
@@ -789,6 +856,7 @@ func (f *Fs) renameDocument(ctx context.Context, id int64, title string) error {
 
 func (f *Fs) Features() *fs.Features { return f.features }
 func (f *Fs) Hashes() hash.Set       { return hash.Set(hash.None) }
+
 func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 	item, err := f.resolveItem(ctx, remote)
 	if err != nil {
@@ -805,7 +873,7 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 
 	obj := &Object{
 		fs:      f,
-		remote:  remote,
+		remote:  route,
 		id:      item.ID,
 		doc:     item,
 		size:    parseSize(item.RawSize),
@@ -819,10 +887,150 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 	}
 	return obj, nil
 }
+
 func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
-	return nil, errors.New("Put operation not implemented")
+	remote := src.Remote()
+	parentPath := path.Dir(remote)
+	if parentPath == "." {
+		parentPath = ""
+	}
+
+	parentID, err := f.resolveFolderID(ctx, parentPath)
+	if err != nil {
+		return nil, err
+	}
+
+	name := path.Base(remote)
+	params := url.Values{
+		"FolderId": []string{strconv.FormatInt(parentID, 10)},
+		"Name":     []string{name},
+	}
+
+	contentType := mime.TypeByExtension(path.Ext(name))
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+
+	opts := rest.Opts{
+		Method:               http.MethodPost,
+		Path:                 "documents",
+		Body:                 in,
+		Options:              options,
+		MultipartParams:      params,
+		MultipartContentName: "file",
+		MultipartFileName:    name,
+		MultipartContentType: contentType,
+	}
+
+	if size := src.Size(); size >= 0 {
+		opts.ContentLength = &size
+	}
+
+	var result DocumentResponse
+	_, err = f.srv.CallJSON(ctx, &opts, nil, &result)
+	if err != nil {
+		return nil, err
+	}
+
+	return &Object{
+		fs:      f,
+		remote:  remote,
+		id:      result.ID,
+		size:    src.Size(),
+		modTime: src.ModTime(ctx),
+		loaded:  false,
+	}, nil
 }
-func (f *Fs) deleteObject(context.Context, string) error {
+
+type TrashResponse struct {
+	Items  []DocumentResponse `json:"items"`
+	Cursor string             `json:"cursor"`
+}
+
+func (f *Fs) listTrash(ctx context.Context) (fs.DirEntries, error) {
+	params := url.Values{
+		"parameters.limit":   {"100"},
+		"parameters.parent":  {"-1"},
+		"parameters.type":    {"documents"},
+		"parameters.deleted": {"true"},
+	}
+
+	var result TrashResponse
+
+	opts := rest.Opts{
+		Method:     http.MethodGet,
+		Path:       "folders/items",
+		Parameters: params,
+	}
+
+	_, err := f.srv.CallJSON(ctx, &opts, nil, &result)
+	if err != nil {
+		return nil, err
+	}
+
+	entries := make(fs.DirEntries, 0, len(result.Items))
+	for _, doc := range result.Items {
+		if doc.FileName == "" {
+			doc.FileName = doc.Name
+		}
+		if doc.FileName == "" {
+			return nil, fmt.Errorf("trashed document %d has no name", doc.ID)
+		}
+
+		entries = append(entries, &Object{
+			fs:      f,
+			remote:  doc.FileName,
+			id:      doc.ID,
+			size:    parseSize(doc.FileSize),
+			modTime: time.Now(),
+			loaded:  false,
+		})
+	}
+
+	return entries, nil
+}
+
+func (f *Fs) restoreDocument(ctx context.Context, id int64) error {
+	var result DocumentResponse
+	contentLength := int64(0)
+
+	opts := rest.Opts{
+		Method:        http.MethodPost,
+		Path:          fmt.Sprintf("documents/%d/restore", id),
+		ContentLength: &contentLength,
+		ExtraHeaders: map[string]string{
+			"Cache-Control": "no-cache",
+			"Pragma":        "no-cache",
+			"Referer":       "https://buzondigital.correos.es/trash",
+		},
+	}
+
+	_, err := f.srv.CallJSON(ctx, &opts, nil, &result)
+	return err
+}
+
+func (f *Fs) deleteDocumentPermanently(ctx context.Context, id int64) error {
+	opts := rest.Opts{
+		Method: http.MethodDelete,
+		Path:   fmt.Sprintf("documents/%d/permanently", id),
+		ExtraHeaders: map[string]string{
+			"Cache-Control": "no-cache",
+			"Pragma":        "no-cache",
+			"Referer":       "https://buzondigital.correos.es/trash",
+		},
+	}
+
+	resp, err := f.srv.Call(ctx, &opts)
+	if err != nil {
+		return err
+	}
+	defer fs.CheckClose(resp.Body, &err)
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("permanent delete failed (%d): %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
 	return nil
 }
 
@@ -836,6 +1044,7 @@ type Object struct {
 	loaded  bool
 }
 
+func (o *Object) ID() string                            { return strconv.FormatInt(o.id, 10) }
 func (o *Object) String() string                        { return o.remote }
 func (o *Object) Remote() string                        { return o.remote }
 func (o *Object) Size() int64                           { return o.size }
@@ -851,7 +1060,22 @@ func (o *Object) Storable() bool { return true }
 func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
 	return errors.New("Update operation not implemented")
 }
-func (o *Object) Remove(ctx context.Context) error { return o.fs.deleteObject(ctx, o.remote) }
+
+func (o *Object) Remove(ctx context.Context) error {
+	if o.fs.opt.TrashedOnly {
+		return o.fs.deleteDocumentPermanently(ctx, o.id)
+	}
+
+	var result DocumentResponse
+
+	opts := rest.Opts{
+		Method: http.MethodDelete,
+		Path:   fmt.Sprintf("documents/%d", o.id),
+	}
+
+	_, err := o.fs.srv.CallJSON(ctx, &opts, nil, &result)
+	return err
+}
 
 func (o *Object) getDocument(ctx context.Context) (*DocumentResponse, error) {
 	opts := rest.Opts{Method: http.MethodGet, Path: fmt.Sprintf("documents/%d", o.id), AuthRedirect: true}
